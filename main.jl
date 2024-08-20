@@ -1,16 +1,110 @@
-using Distributions
-using GLMakie
-using LinearAlgebra
-using Random
-using StaticArrays
-using Statistics
+"""
+This file contains implementations of bayesian polynomial regression.
+All models assume the noise level is known.
+Main components:
 
-struct AuxiliaryDistribution{D,C}
+* `struct Joint` describes the probabilistic model for this task.
+* `condition(joint::Joint, degree, y)` conditions the model on 
+  observations `y` and a specific polynomial degree. 
+  This can be done in closed form, therefore this function returns
+  a probability distribution (`MvNormal`).
+* `sample(joint::Joint, y, ...)` samples from the model given only
+  observations `y` using involutive MCMC
+
+See demo.jl for how to use.
+"""
+
+using Distributions
+using LinearAlgebra
+
+"""
+    Joint
+
+parameters of joint probability distribution for the random variables `y`, `Rβ` and `d`:
+y ~ MvNormal(ŷ, `likelihood_variance`)
+ŷ = Q * Rβ
+Rβ ~ MvNormal(zeros(d + 1), `prior_variance`)
+d ~ `prior_degree_dist`
+"""
+struct Joint{D}
+    x::Vector{Float64}
+    prior_degree_dist::D
+    prior_variance::Float64
+    likelihood_variance::Float64
+end
+
+"""
+    logpdf(target, (Rβ, y))
+
+Evaluate (non-normalized) log density of joint distribution at `Rβ`, `d`, `y`.
+"""
+function Distributions.logpdf(joint::Joint, (Rβ, y))
+    # Polynomial degree:
+    degree = length(Rβ) - 1
+    # Estimate y given polynomial coefficients and x:
+    # X = design_matrix(x, degree)
+    # ŷ = X * β = QR * β = Q * Rβ
+    X = design_matrix(joint.x, degree)
+    Q, R = qr(X)  # X = Q*R
+    ŷ = Q * Rβ
+
+    # Prior for Rβ:
+    # Assume independently normally distributed around zero:
+    prior_coef_dist = MvNormal(zeros(degree + 1), joint.prior_variance * I)
+
+    # Gaussian likelihood around ŷ:
+    likelihood_dist = MvNormal(ŷ, joint.likelihood_variance * I)
+
+    # Return total log density
+    return logpdf(likelihood_dist, y) +  # p(y | ŷ)
+           logpdf(joint.prior_degree_dist, degree) +  # p(degree)
+           logpdf(prior_coef_dist, Rβ)  # p(β)
+end
+
+"""
+    SimpleAuxiliaryDistribution
+
+parameters of a distribution for auxiliary variables conditioned on current
+non-auxiliary variables.
+"""
+struct SimpleAuxiliaryDistribution{D,C}
     increase_dist::D
     coef_dist::C
 end
 
-function Base.rand(dist::AuxiliaryDistribution)
+"""
+    SimpleAuxiliaryDistribution(joint, Rβ, y)
+
+Create auxiliary distribution conditioned on current state `Rβ` and observations `y`
+"""
+function SimpleAuxiliaryDistribution(joint::Joint, Rβ, y)
+    # Distribution for auxiliary variable(s) given current state
+    degree = length(Rβ) - 1
+    max_degree = length(y) - 1
+
+    increase_dist = if degree == 0
+        # if currently constant polynomial, definitely increase degree
+        Bernoulli(1.0)
+    elseif degree == max_degree
+        # if currently maximal possible degree, definitely decrease degree
+        Bernoulli(0.0)
+    else
+        # else 50:50 chance
+        Bernoulli(0.5)
+    end
+
+    # use prior for coefficients as proposal for new coefficient:
+    coef_dist = Normal(0.0, sqrt(joint.prior_variance))
+
+    return SimpleAuxiliaryDistribution(increase_dist, coef_dist)
+end
+
+"""
+    rand(aux_dist)
+
+Take a random sample from auxiliary distribution
+"""
+function Base.rand(dist::SimpleAuxiliaryDistribution)
     increase = rand(dist.increase_dist)
     coef = if increase
         rand(dist.coef_dist)
@@ -20,8 +114,13 @@ function Base.rand(dist::AuxiliaryDistribution)
     (; increase, coef)
 end
 
+"""
+    logpdf(aux_dist, sample)
+
+Evaluate log density of `aux_dist` at `sample`.
+"""
 function Distributions.logpdf(
-    dist::AuxiliaryDistribution, val::NamedTuple{(:increase, :coef)}
+    dist::SimpleAuxiliaryDistribution, val::NamedTuple{(:increase, :coef)}
 )
     increase = val.increase
     score = logpdf(dist.increase_dist, increase)
@@ -31,7 +130,15 @@ function Distributions.logpdf(
     score
 end
 
-function involution!(coefs, aux::NamedTuple{(:increase, :coef)})
+"""
+    push_pop_involution!(coefs, aux)
+
+If `aux.increase`, push `aux.coef` to the end of `coefs`,
+otherwise do the inverse.
+One property of this function (and all involutions) is:
+`coefs, aux == involution!(involution!(copy(coefs), aux)[1:2]...)`
+"""
+function push_pop_involution!(coefs, aux::NamedTuple{(:increase, :coef)})
     logabsdet = 0.0
     if aux.increase
         coefs = push!(coefs, aux.coef)
@@ -43,255 +150,116 @@ function involution!(coefs, aux::NamedTuple{(:increase, :coef)})
 end
 
 """
-    gen_data_and_true_coefs(n, degree, xmin, xmax, σ)
+    condition(joint, degree, y)
 
-Generate data 
+Condition `joint`` on `degree` and `y`
+I.e. return the posterior distribution over polynomial coefficients Rβ
+given observations `y` and a given `degree`
 """
-function gen_data_and_true_coefs(n, degree, xmin, xmax, σ)
-    x = rand(n) * (xmax - xmin) .- xmax
-    X = design_matrix(x, degree)
-    QR = qr(X)
-    # isotropic gaussian coefficients in *orthogonal basis*
-    Rβ = randn(degree + 1)
-    # coefficients in standard basis
-    β = inv(QR.R) * Rβ
-    # same as y = X * β + σ * randn(n)
-    y = QR.Q * Rβ + σ * randn(n)
-    return x, y, β
+function condition(joint::Joint, degree::Int, y)
+    # assume linear-gaussian model, i.e.
+    # gaussian prior and gaussian likelihood:
+    # Rβ ~ MvNormal(0, σ1)
+    # ŷ = Q * Rβ
+    # y ~ MvNormal(ŷ, σ2) 
+    # 
+    # return posterior for Rβ which is again gaussian
+    X = design_matrix(joint.x, degree)
+    Q, R = qr(X)
+
+    prior_precision = inv(joint.prior_variance)
+    likelihood_precision = inv(joint.likelihood_variance)
+    posterior_variance = inv(prior_precision + likelihood_precision)  # Bishop 2.117 
+    posterior_mean = (posterior_variance * I) * Matrix(Q)' * (likelihood_precision * I) * y  # Bishop 2.116
+    return MvNormal(posterior_mean, posterior_variance * I)
 end
 
-function plot_data_and_truth(x, y, β)
-    x_plot = range(extrema(x)...; length=100)
-    X_plot = design_matrix(x_plot, length(β) - 1)
-    y_plot = X_plot * β
-    lines(x_plot, y_plot; label="Truth")
-    scatter!(x, y; label="Data")
-    current_figure()
+"""
+    randprior(joint)
+
+Perform ancestral sampling using prior distributions and return sample.
+"""
+function randprior(joint::Joint)
+    degree = rand(joint.prior_degree_dist)
+    # Prior for Rβ:
+    # Assume independently normally distributed around zero:
+    prior_coef_dist = MvNormal(zeros(degree + 1), joint.prior_variance * I)
+    Rβ = rand(prior_coef_dist)
+    return degree, Rβ
 end
 
-function plot_samples!(
-    p,
-    xmin,
-    xmax,
-    βs::AbstractVector{<:AbstractVector};
-    color=:red,
-    maxsamples=length(βs),
-    label=nothing,
-)
-    x = range(xmin, xmax; length=100)
-    y_mean = zeros(100)
-    idxs = shuffle(eachindex(βs))
-    meanlabel = isnothing(label) ? nothing : "mean $label"
-    n_plotted = 0
-    for i in idxs
-        β = βs[i]
-        X = design_matrix(x, length(β) - 1)
-        y = X * β
-        y_mean .+= y
-        if n_plotted < maxsamples
-            lines!(p, x, y; color, alpha=0.2, label)
-            label = nothing
-            n_plotted += 1
-        end
+"""
+    involutive_mc_step(Rβ, ...)
+
+Perform a single involutive Metropolis-Hastings step.
+"""
+function involutive_mc_step(Rβ, target, y, aux_dist, involution)
+    log_p_old = logpdf(target, (Rβ, y))  # logdensity of target at current Rβ
+    aux_dist_old = aux_dist(target, Rβ, y)  # auxiliary distribution given current Rβ
+    aux_old = rand(aux_dist_old)  # sample auxiliary state
+    log_q_old = logpdf(aux_dist_old, aux_old)  # evaluate logpdf of auxiliary state
+
+    Rβ, aux_new, lad_jacobian = involution(Rβ, aux_old)
+
+    log_p_new = logpdf(target, (Rβ, y))  # logdensity of target at *proposed* Rβ
+    aux_dist_new = aux_dist(target, Rβ, y)  # auxiliary distribution given *proposed* Rβ
+    log_q_new = logpdf(aux_dist_new, aux_new)
+
+    acceptance_probability = exp(
+        log_p_new + log_q_new - log_p_old - log_q_old + lad_jacobian
+    )
+
+    accepted = rand() < acceptance_probability
+
+    if !accepted
+        # simply call involution again to return to old Rβ
+        Rβ, _, _ = involution(Rβ, aux_new)
     end
-    y_mean ./= length(βs)
-    lines!(p, x, y_mean; color, label=meanlabel)
+
+    return accepted, Rβ
 end
 
-function posterior_Rβ(
-    x, y, prior_precision, likelihood_precision, degree=size(prior_precision, 1)
-)
-    X = design_matrix(x, degree)
-    QR = qr(X)
-    posterior_Rβ(QR, y, prior_precision, likelihood_precision)
-end
+"""
+    sample(...)
 
-function posterior_Rβ(
-    QR::GLMakie.LinearAlgebra.QRCompactWY, y, prior_precision, likelihood_precision
-)
-    Q = QR.Q
-    # Q * Rβ = y + e,  e ~ Normal(0, σ)
-    posterior_cov = posterior_covariance(prior_precision * I, likelihood_precision, Q)
-    posterior_mean = posterior_cov * Matrix(Q)' * (likelihood_precision * I) * y
-    posterior = MvNormal(posterior_mean, posterior_cov)
-    posterior, QR.R
-end
-
-function sample_posteriorβ(x, y, degree, prior_precision, likelihood_precision, n)
-    posterior, R = posterior_Rβ(x, y, prior_precision, likelihood_precision, degree)
-    samples_Rβ = rand(posterior, n)
-    samples_β = inv(R) * samples_Rβ
-    reinterpret(reshape, SVector{degree + 1,Float64}, samples_β)
-end
-
-function log_posterior_Rβ_degree_nonorm_and_R(
-    Rβ,
-    x,
-    y,
-    prior_degree_dist::DiscreteUnivariateDistribution,
-    prior_precision::Number,
-    likelihood_precision::Number,
-)
-    degree = length(Rβ) - 1
-    prior_Rβ_cov = inv(prior_precision * I)
-    prior_Rβ_dist = MvNormal(zeros(degree + 1), prior_Rβ_cov)
-    likelihood_cov = inv(likelihood_precision * I)
-    QR = qr(design_matrix(x, degree))
-    likelihood_dist = MvNormal(QR.Q * Rβ, likelihood_cov)
-
-    logpdf(likelihood_dist, y) +
-    logpdf(prior_degree_dist, degree) +
-    logpdf(prior_Rβ_dist, Rβ),
-    QR.R
-end
-
-function involutive_mcmc(
-    x,
-    y,
-    prior_degree_dist,
-    prior_precision::Number,
-    likelihood_precision::Number,
-    n::Int,
-    sample_from_posterior,
-    init_degree=rand(prior_degree_dist),
+sample from `target` using involutive MCMC.
+"""
+function sample(
+    target::Joint, y, aux_dist, involution, n_samples::Int, init_state=randprior(target)
 )
     βs = Vector{Float64}[]
     Rβs = Vector{Float64}[]
-    degree = init_degree
-    # directly sample initial Rβ from posterior conditional on degree
-    Rβ_dist, R = posterior_Rβ(x, y, prior_precision, likelihood_precision, degree)
-    Rβ = rand(Rβ_dist)
-    β = inv(R) * Rβ
-    push!(Rβs, copy(Rβ))
-    push!(βs, β)
-    for i in 2:n
-        if mod(i, 2) == 0
-            Rβ, R, accepted = involution_kernel!(
-                Rβ,
-                x,
-                y,
-                prior_degree_dist,
-                prior_precision,
-                likelihood_precision,
-                sample_from_posterior,
-            )
+    degrees = Int[]
+    accepteds = Bool[]
+    # sample initial state (from prior):
+    degree, Rβ = init_state
+    # Gibbs sampling:
+    # every odd step sample from p(Rβ | degree)
+    # every even step sample from full p(Rβ, degree)
+    for i in 2:n_samples
+        if mod(i, 2) == 0  # sample from full posterior
+            accepted, Rβ = involutive_mc_step(Rβ, target, y, aux_dist, involution)
             degree = length(Rβ) - 1
-        else
-            Rβ_dist, R = posterior_Rβ(x, y, prior_precision, likelihood_precision, degree)
+            push!(accepteds, accepted)
+        else  # sample β
+            Rβ_dist = condition(target, degree, y)  # target conditioned on degree and y
+            # can directly sample from this
             Rβ = rand(Rβ_dist)
         end
-        try
-            β = inv(R) * Rβ
-        catch e
-            if e isa LAPACKException
-                throw(BetterLAPACKException(i, R))
-            end
-            rethrow(e)
-        end
-        push!(Rβs, copy(Rβ))
+        Q, R = qr(design_matrix(target.x, degree))
+        β = R \ Rβ
         push!(βs, β)
+        push!(Rβs, copy(Rβ))
+        push!(degrees, degree)
     end
-    βs, Rβs
+    βs, Rβs, degrees, accepteds
 end
 
-struct BetterLAPACKException <: Exception
-    i::Int
-    R::Matrix{Float64}
-end
+"""
+    design_matrix(x, degree)
 
-function Base.showerror(io::IO, e::BetterLAPACKException)
-    print(io, "BetterLAPACKException:\n")
-    print(io, "Matrix R in iteration $(e.i) seems to be not invertible:\n")
-    print(io, "$(e.R)")
-end
-
-function involution_kernel!(
-    Rβ,
-    x,
-    y,
-    prior_degree_dist,
-    prior_precision,
-    likelihood_precision,
-    sample_from_posterior,
-)
-    log_p_old, R_old = log_posterior_Rβ_degree_nonorm_and_R(
-        Rβ, x, y, prior_degree_dist, prior_precision, likelihood_precision
-    )
-    aux_dist_old = make_aux_dist(Rβ, x, y, prior_precision, likelihood_precision, sample_from_posterior)
-    aux_old = rand(aux_dist_old)
-    log_q_old = logpdf(aux_dist_old, aux_old)
-
-    Rβ_new, aux_new, logabsdet = involution!(Rβ, aux_old)
-    aux_dist_new = make_aux_dist(Rβ_new, x, y, prior_precision, likelihood_precision, sample_from_posterior)
-    log_p_new, R_new = log_posterior_Rβ_degree_nonorm_and_R(
-        Rβ_new, x, y, prior_degree_dist, prior_precision, likelihood_precision
-    )
-    log_q_new = logpdf(aux_dist_new, aux_new)
-
-    a = exp(log_p_new + log_q_new - log_p_old - log_q_old + logabsdet)
-
-    accepted = if rand() < a
-        # accept
-        Rβ = Rβ_new
-        R = R_new
-        true
-    else
-        # reject. Run involution again
-        Rβ, _, _ = involution!(Rβ_new, aux_new)
-        R = R_old
-        false
-    end
-    @show log_p_new, log_q_new, log_p_old, log_q_old, a, accepted
-    return Rβ, R, accepted
-end
-
-function make_aux_dist(Rβ, x, y, prior_precision, likelihood_precision, sample_from_posterior)
-    degree = length(Rβ) - 1
-    max_degree = length(y) - 1
-
-    increase_dist = if degree == 0
-        Bernoulli(1.0)
-    elseif degree == max_degree
-        Bernoulli(0.0)
-    else
-        Bernoulli(0.5)
-    end
-    coef_dist = if sample_from_posterior
-        posterior_higher_degree = posterior_Rβ(
-            x, y, prior_precision, likelihood_precision, degree + 1
-        )[1]
-        posterior_higher_degree_mean = mean(posterior_higher_degree)
-        posterior_higher_degree_precision = invcov(posterior_higher_degree)
-        posterior_cov = inv(posterior_higher_degree_precision[end, end])
-        posterior_mean = @views posterior_higher_degree_mean[degree + 2] -
-            posterior_cov * dot(
-            posterior_higher_degree_precision[end, 1:(end - 1)],
-            (Rβ - posterior_higher_degree_mean[1:(end - 1)]),
-        )
-        Normal(posterior_mean, sqrt(posterior_cov))
-    else
-        Normal(0.0, sqrt(inv(prior_precision)))
-    end
-
-    AuxiliaryDistribution(increase_dist, coef_dist)
-end
-
+return the [Vandermonde-matrix](https://en.wikipedia.org/wiki/Vandermonde_matrix) of x
+"""
 function design_matrix(x, degree)
     degree == 0 ? ones(length(x), 1) : reduce(hcat, x .^ i for i in 0:degree)
-end
-
-function posterior_covariance(prior_precision, likelihood_precision, design_matrix)
-    inv(prior_precision + design_matrix' * likelihood_precision * design_matrix)
-end
-
-function posterior_covariance(
-    prior_precision, likelihood_precision::Number, design_matrix::LinearAlgebra.QRCompactWYQ
-)
-    posterior_covariance(prior_precision, likelihood_precision * I, design_matrix)
-end
-
-function posterior_covariance(
-    prior_precision, likelihood_precision::UniformScaling, ::LinearAlgebra.QRCompactWYQ
-)
-    inv(prior_precision + likelihood_precision)
 end
